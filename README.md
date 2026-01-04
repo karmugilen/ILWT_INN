@@ -27,7 +27,7 @@ This repository contains the code for training and using the model.
 
    ```bash
    git clone <repository-url>
-   cd StegoWaveFlow
+   cd <repository-folder>
    ```
 
 2. **Install requirements:**
