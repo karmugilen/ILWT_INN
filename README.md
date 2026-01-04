@@ -1,6 +1,6 @@
-# StegoWaveFlow: High-Quality Video Steganography
+#High-Quality Video Steganography
 
-**StegoWaveFlow** is a tool for hiding data in videos. It uses **Invertible Neural Networks (INNs)** and **Integer Discrete Wavelet Transforms (ILWT)** to hide images inside videos while keeping high quality.
+**INN_ILWT** is a tool for hiding data in videos. It uses **Invertible Neural Networks (INNs)** and **Integer Discrete Wavelet Transforms (ILWT)** to hide images inside videos while keeping high quality.
 
 This repository contains the code for training and using the model.
 
@@ -79,7 +79,7 @@ Results are saved in a folder named `[video_name]_output/`:
 
 ![Training Architecture](docs/images/training_detailed_arch.png)
 
-Use `train.py` to train your own version of the `StegoWaveFlow` model.
+Use `train.py` to train your own version of the `INN_ILWT` model.
 
 **Steps:**
 
