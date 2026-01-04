@@ -1,4 +1,4 @@
-#High-Quality Video Steganography
+# High-Quality Video Steganography
 
 **INN_ILWT** is a tool for hiding data in videos. It uses **Invertible Neural Networks (INNs)** and **Integer Discrete Wavelet Transforms (ILWT)** to hide images inside videos while keeping high quality.
 
