@@ -27,7 +27,7 @@ from core.models import create_model
 from shell.io import (
     convert_y4m_to_mp4, extract_frames, frames_to_video, get_video_fps,
     cleanup_output, get_file_size, load_model_weights,
-    load_image, load_16bit_image, save_16bit_png, list_images_in_dir,
+    load_image, load_8bit_image, save_8bit_png, list_images_in_dir,
     save_per_frame_metrics_csv, save_average_metrics_csv, save_results_txt,
     save_results_json
 )
@@ -98,7 +98,7 @@ async def embed_all_frames(
             frame_idx = batch_start + idx
             output_path = stego_frames_dir / f"frame_{frame_idx+1:05d}.png"
             def _save():
-                save_16bit_png(tensor, output_path)
+                save_8bit_png(tensor, output_path)
             await loop.run_in_executor(None, _save)
             return hide_tensor.cpu()
         
@@ -134,7 +134,7 @@ async def recover_all_frames(
         # Load stego frames concurrently
         async def load_stego(i):
             def _load():
-                return load_16bit_image(stego_frames[i], size)
+                return load_8bit_image(stego_frames[i], size)
             return await loop.run_in_executor(None, _load)
         
         stego_tensors = await asyncio.gather(*[load_stego(i) for i in batch_indices])
@@ -153,7 +153,7 @@ async def recover_all_frames(
             frame_idx = batch_start + idx
             output_path = recovered_dir / f"recovered_{frame_idx+1:05d}.png"
             def _save():
-                save_16bit_png(tensor, output_path)
+                save_8bit_png(tensor, output_path)
             await loop.run_in_executor(None, _save)
         
         await asyncio.gather(*[
@@ -251,7 +251,7 @@ async def run_pipeline(
         embed_time = embed_end_time - embed_start_time
         
         # Create stego video (shell)
-        stego_video = output_dir / "stego_video.mp4"
+        stego_video = output_dir / "stego_video.mkv"
         
         if config.processing.interactive:
              print(f"\nNext: Create stego video at {stego_video}")
@@ -313,6 +313,11 @@ async def run_pipeline(
         if config.processing.cleanup:
             cleanup_output(output_dir, config.processing.keep_patterns)
         
+        result['timing'] = timing_info
+        result['file_sizes'] = {
+            'original_video': original_video_size,
+            'stego_video': stego_video_size
+        }
         result['success'] = True
         
     except Exception as e:

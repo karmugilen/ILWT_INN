@@ -217,7 +217,6 @@ def main():
                 print(f"     • {r['file']}: {r['error']}")
     
     # Print average metrics if available
-    # Results summary removed as per user request
     # Check results.txt/json in output folder if metrics were enabled
     pass
     

@@ -34,7 +34,7 @@ from core.models import (
 
 # Dataset
 class ImageSteganographyDataset(Dataset):
-    def __init__(self, image_dir, img_size=224, transform=None):
+    def __init__(self, image_dir, img_size=224, transform=None, augment=True):
         png_files = glob.glob(os.path.join(image_dir, "*.png"))
         jpg_files = glob.glob(os.path.join(image_dir, "*.jpg"))
         jpeg_files = glob.glob(os.path.join(image_dir, "*.jpeg"))
@@ -42,17 +42,36 @@ class ImageSteganographyDataset(Dataset):
         self.img_size = img_size
 
         if transform is None:
-            self.transform = transforms.Compose(
-                [
-                    transforms.Resize(
-                        (img_size, img_size),
-                        interpolation=InterpolationMode.BICUBIC,
-                        antialias=True,
-                    ),
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-                ]
-            )
+            if augment:
+                # Augmentation inflates effective dataset size — important when
+                # training on << 40k images. Each host/secret is sampled
+                # independently so they get independent augmentation.
+                self.transform = transforms.Compose(
+                    [
+                        transforms.Resize(
+                            (int(img_size * 1.125), int(img_size * 1.125)),
+                            interpolation=InterpolationMode.BICUBIC,
+                            antialias=True,
+                        ),
+                        transforms.RandomCrop((img_size, img_size)),
+                        transforms.RandomHorizontalFlip(p=0.5),
+                        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+                        transforms.ToTensor(),
+                        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                    ]
+                )
+            else:
+                self.transform = transforms.Compose(
+                    [
+                        transforms.Resize(
+                            (img_size, img_size),
+                            interpolation=InterpolationMode.BICUBIC,
+                            antialias=True,
+                        ),
+                        transforms.ToTensor(),
+                        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                    ]
+                )
         else:
             self.transform = transform
 
@@ -358,20 +377,18 @@ def ilwt_multiscale_secret_loss(ilwt_module, secret_img, recovered_secret, subba
     return loss_lvl1 + loss_lvl2
 
 
-def perturb_stego_like_for_inverse(
-    stego_host, q_prob=0.5, noise_prob=0.5, noise_sigma=0.01
-):
+def perturb_stego_like_for_inverse(stego_host, noise_sigma=0.0):
     """
-    Apply mild, differentiable-ish perturbations to stego before inverse path to
-    simulate file I/O effects. Quantization-like rounding and small Gaussian noise.
+    Quantize stego to 8-bit to match the deployment storage exactly.
+    Uses a straight-through estimator (STE): the forward pass returns the
+    quantized tensor, but gradients flow through as if it were the identity,
+    so the model learns to be robust to the round-trip.
     """
-    x = stego_host
-    if random.random() < q_prob:
-        # Simulate 8-bit quantization in normalized space
-        x_01 = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
-        x_q = torch.round(x_01 * 255.0) / 255.0
-        x = x_q * 2.0 - 1.0
-    if random.random() < noise_prob:
+    x_01 = torch.clamp((stego_host + 1.0) / 2.0, 0.0, 1.0)
+    x_q = torch.round(x_01 * 255.0) / 255.0
+    x_q = x_01 + (x_q - x_01).detach()
+    x = x_q * 2.0 - 1.0
+    if noise_sigma > 0.0:
         noise = torch.randn_like(x) * noise_sigma
         x = torch.clamp(x + noise, -1.0, 1.0)
     return x
@@ -700,34 +717,41 @@ def train_model(model, train_dataset, val_dataset, num_epochs=150, save_metrics=
         model.train()
         epoch_train_loss = 0.0
 
+        # Gradient accumulation: effective batch ≈ accum_steps × batch_size.
+        # batch_size is hard-pinned to 1 for ILWT padding safety; accumulation
+        # gives stable updates without the per-batch noise.
+        accum_steps = 8
+
         # Training loop
         loop = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
+        optimizer.zero_grad()
         for batch_idx, (input_tensor, host_tensor, secret_tensor) in enumerate(loop):
             # Non-blocking GPU transfer for faster data loading
             input_tensor = input_tensor.to(device, non_blocking=True)
             host_tensor = host_tensor.to(device, non_blocking=True)
             secret_tensor = secret_tensor.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-
             # Mixed precision forward pass
             with torch.cuda.amp.autocast(enabled=use_amp):
                 stego_output, log_det = model(input_tensor)
                 host_input = input_tensor[:, :3, :, :]
                 stego_host = stego_output[:, :3, :, :]
+                # Quantize stego to 8-bit (matches PNG storage). Straight-through
+                # estimator lets gradients flow so the model learns 8-bit-robust embedding.
+                stego_host_q = perturb_stego_like_for_inverse(stego_host)
                 # Stego-only inverse: append zeros for the missing channels
                 stego_like = torch.cat(
-                    [stego_host, torch.zeros_like(stego_host)], dim=1
+                    [stego_host_q, torch.zeros_like(stego_host_q)], dim=1
                 )
                 reconstructed_input = model.inverse(stego_like)
                 recovered_secret = reconstructed_input[:, 3:, :, :]
 
-                # Target-Driven Loss (Goal: 42 dB)
+                # Hiding loss compares against the quantized stego (the actual stored output)
                 loss, hiding_loss, rec_mse, rec_ssim, w_hid, w_rec = steganography_loss(
                     secret_tensor,
                     recovered_secret,
                     host_tensor,
-                    stego_host,
+                    stego_host_q,
                     model.ilwt,
                     model.subband_weights,
                     target_psnr=42.0
@@ -736,12 +760,17 @@ def train_model(model, train_dataset, val_dataset, num_epochs=150, save_metrics=
                 # ms_loss is already included in steganography_loss
 
 
-            # Mixed precision backward pass
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Less aggressive (was 0.5)
-            scaler.step(optimizer)
-            scaler.update()
+            # Scale by accum_steps so the accumulated grad has correct magnitude
+            scaler.scale(loss / accum_steps).backward()
+
+            # Step optimizer every accum_steps mini-batches (or at end of epoch)
+            is_accum_boundary = ((batch_idx + 1) % accum_steps == 0) or ((batch_idx + 1) == len(train_dataloader))
+            if is_accum_boundary:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             
             # Log gradients for first batch to monitor learning
             if batch_idx == 0 and epoch % 1 == 0:
@@ -787,27 +816,29 @@ def train_model(model, train_dataset, val_dataset, num_epochs=150, save_metrics=
                         stego_output, log_det = model(input_tensor)
                         host_input = input_tensor[:, :3, :, :]
                         stego_host = stego_output[:, :3, :, :]
+                        # Mirror training: quantize stego to 8-bit before recovery
+                        stego_host_q = perturb_stego_like_for_inverse(stego_host)
 
-                        # Validation: use stego image to recover secret
-                        stego_like = torch.cat([stego_host, torch.zeros_like(stego_host)], dim=1)
+                        # Validation: use quantized stego image to recover secret
+                        stego_like = torch.cat([stego_host_q, torch.zeros_like(stego_host_q)], dim=1)
                         reconstructed_input = model.inverse(stego_like)
                         recovered_secret = reconstructed_input[:, 3:, :, :]
 
-                    # Calculate validation loss
+                    # Calculate validation loss against the quantized stego (what gets stored)
                     total_val_loss, val_hiding_psnr, val_recovery_psnr, val_rec_ssim_val, _, _ = steganography_loss(
                         secret_tensor,
                         recovered_secret,
                         host_input,
-                        stego_host,
+                        stego_host_q,
                         model.ilwt,
                         model.subband_weights,
-                        target_psnr=42.0 # Example target PSNR
+                        target_psnr=42.0
                     )
 
                     val_losses.append(total_val_loss.item())
-                    
-                    # Calculate metrics
-                    val_hiding_psnr = calculate_psnr(stego_host, host_tensor)
+
+                    # Validation metrics also reflect the 8-bit-stored stego
+                    val_hiding_psnr = calculate_psnr(stego_host_q, host_tensor)
                     val_recovery_psnr = calculate_psnr(recovered_secret, secret_tensor)
                     # val_rec_ssim_val is already SSIM value, no conversion needed
                     # val_rec_ssim_val = 1.0 - val_rec_ssim.item()  <-- REMOVED
@@ -838,14 +869,16 @@ def train_model(model, train_dataset, val_dataset, num_epochs=150, save_metrics=
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=use_amp):
                 stego_output, log_det = model(input_tensor)
                 stego_host = stego_output[:, :3, :, :]
+                # Mirror training: quantize to 8-bit before recovery
+                stego_host_q = perturb_stego_like_for_inverse(stego_host)
 
-                # Sample validation: use stego image to recover secret
-                stego_like = torch.cat([stego_host, torch.zeros_like(stego_host)], dim=1)
+                # Sample validation: use quantized stego to recover secret
+                stego_like = torch.cat([stego_host_q, torch.zeros_like(stego_host_q)], dim=1)
                 reconstructed_input = model.inverse(stego_like)
                 recovered_secret = reconstructed_input[:, 3:, :, :]
 
-                # Calculate sample metrics
-                sample_hiding_psnr = calculate_psnr(stego_host, host_tensor)
+                # Sample metrics reflect 8-bit-stored stego
+                sample_hiding_psnr = calculate_psnr(stego_host_q, host_tensor)
                 sample_recovery_psnr = calculate_psnr(recovered_secret, secret_tensor)
                 rec_ssim_val = calculate_ssim(recovered_secret, secret_tensor).item()  # Note: this is SSIM, not loss
                 sample_bit_acc, sample_bpp, _ = calculate_bit_acc_and_bpp(recovered_secret, secret_tensor)
@@ -891,13 +924,13 @@ def train_model(model, train_dataset, val_dataset, num_epochs=150, save_metrics=
                   f"Val Rec SSIM: {avg_val_recovery_ssim:.4f}, "
                   f"Val ACC: {avg_val_bit_acc:.4f}")
 
-        # Calculate additional metrics from the sample batch
-        sample_hiding_mse = F.mse_loss(stego_host, host_tensor).item()
+        # Calculate additional metrics from the sample batch (against 8-bit-stored stego)
+        sample_hiding_mse = F.mse_loss(stego_host_q, host_tensor).item()
         sample_recovery_mse = F.mse_loss(recovered_secret, secret_tensor).item()
-        sample_hiding_ssim = calculate_ssim(stego_host, host_tensor).item()
+        sample_hiding_ssim = calculate_ssim(stego_host_q, host_tensor).item()
         sample_ber, _, _ = calculate_bit_acc_and_bpp(recovered_secret, secret_tensor)
-        sample_hiding_hr = calculate_hiding_ratio(host_tensor, stego_host)
-        sample_bir = calculate_bitrate_increase_ratio(host_tensor, stego_host)
+        sample_hiding_hr = calculate_hiding_ratio(host_tensor, stego_host_q)
+        sample_bir = calculate_bitrate_increase_ratio(host_tensor, stego_host_q)
 
         # Skip complex validation metric calculations for now to avoid errors
         # We'll calculate them properly in the actual validation loop above
@@ -1031,23 +1064,24 @@ def test_model(model, dataset, num_samples=10):
             # Forward pass - create stego image
             stego_output, _ = model(input_tensor)
 
-            # Inverse pass - recover secret using stego-only path
+            # Inverse pass - recover secret using 8-bit-quantized stego-only path
             stego_host = stego_output[:, :3, :, :]
-            stego_like = torch.cat([stego_host, torch.zeros_like(stego_host)], dim=1)
+            stego_host_q = perturb_stego_like_for_inverse(stego_host)
+            stego_like = torch.cat([stego_host_q, torch.zeros_like(stego_host_q)], dim=1)
             reconstructed_input = model.inverse(stego_like)
             recovered_secret = reconstructed_input[:, 3:, :, :]
 
-            # Calculate metrics
-            hiding_psnr = calculate_psnr(stego_host, host_tensor)
+            # Metrics against the 8-bit-stored stego (deployment-accurate)
+            hiding_psnr = calculate_psnr(stego_host_q, host_tensor)
             recovery_psnr = calculate_psnr(recovered_secret, secret_tensor)
-            hiding_ssim = calculate_ssim(stego_host, host_tensor)
+            hiding_ssim = calculate_ssim(stego_host_q, host_tensor)
             recovery_ssim = calculate_ssim(recovered_secret, secret_tensor)
             bit_acc, bpp, ber = calculate_bit_acc_and_bpp(recovered_secret, secret_tensor)
-            hiding_hr = calculate_hiding_ratio(host_tensor, stego_host)
-            hiding_bir = calculate_bitrate_increase_ratio(host_tensor, stego_host)
-            
+            hiding_hr = calculate_hiding_ratio(host_tensor, stego_host_q)
+            hiding_bir = calculate_bitrate_increase_ratio(host_tensor, stego_host_q)
+
             # Calculate MSE for additional metrics
-            hiding_mse = F.mse_loss(stego_host, host_tensor)
+            hiding_mse = F.mse_loss(stego_host_q, host_tensor)
             recovery_mse = F.mse_loss(recovered_secret, secret_tensor)
 
             all_hiding_psnr.append(hiding_psnr.item())
@@ -1077,7 +1111,7 @@ def test_model(model, dataset, num_samples=10):
 
             host_vis = denormalize(host_tensor[0]).permute(1, 2, 0).cpu().numpy()
             secret_vis = denormalize(secret_tensor[0]).permute(1, 2, 0).cpu().numpy()
-            stego_vis = denormalize(stego_host[0]).permute(1, 2, 0).cpu().numpy()
+            stego_vis = denormalize(stego_host_q[0]).permute(1, 2, 0).cpu().numpy()
             recovered_vis = (
                 denormalize(recovered_secret[0]).permute(1, 2, 0).cpu().numpy()
             )
@@ -1212,14 +1246,15 @@ def main():
 
     image_dir = "training_data"
     img_size = 256
-    num_blocks = 8  # Increased from 6 for better capacity
-    hidden_channels = 128  # Increased from 96 for wider network
-    num_epochs = 100  # Quick test with all features
-    num_test_samples = 5  # Reduced for research testing
+    num_blocks = 8
+    hidden_channels = 128
+    num_epochs = 100  # full from-scratch budget; halve when fine-tuning
+    num_test_samples = 5
+    # Set to a .pth path to fine-tune from an existing model. None = from scratch.
+    init_checkpoint = None
 
-    # Load full dataset
-    full_dataset = ImageSteganographyDataset(image_dir, img_size=img_size)
-    print(f"Loaded {len(full_dataset)} images")
+    full_dataset = ImageSteganographyDataset(image_dir, img_size=img_size, augment=True)
+    print(f"Loaded {len(full_dataset)} images (with augmentation)")
 
     # Split dataset into train, validation, and test
     train_dataset, val_dataset, test_dataset = split_dataset(
@@ -1245,6 +1280,21 @@ def main():
         hidden_channels=hidden_channels,
         transform_type="ilwt53",
     )
+
+    # Optional fine-tune init. When set, loads weights and only trains the
+    # last-mile adjustments — much faster than from scratch.
+    if init_checkpoint and os.path.exists(init_checkpoint):
+        ckpt = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
+        state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"Initialized from checkpoint: {init_checkpoint}")
+        if missing:
+            print(f"  Missing keys ({len(missing)}): first few = {missing[:3]}")
+        if unexpected:
+            print(f"  Unexpected keys ({len(unexpected)}): first few = {unexpected[:3]}")
+    else:
+        print("Training from scratch")
+
     model, metrics_history = train_model(model, train_dataset, val_dataset, num_epochs=num_epochs)
 
     torch.save(model.state_dict(), "ilwt_steganography_model_research.pth")
@@ -1284,7 +1334,7 @@ def main():
 
 
 def generate_research_plots(metrics_history):
-    """Generate comprehensive plots for research paper with train/validation metrics"""
+    """Generate comprehensive plots with train/validation metrics"""
     import matplotlib.pyplot as plt
     
     # Clean and create research plots directory

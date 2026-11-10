@@ -22,14 +22,16 @@ from torchvision import transforms
 
 def convert_y4m_to_mp4(y4m_path: Path, output_mp4: Path, size: int = 256) -> Tuple[bool, Optional[str]]:
     """
-    Convert Y4M file to MP4 at specified resolution.
-    
+    Convert Y4M to a lossless FFV1/MKV file at specified resolution (8-bit planar RGB).
+
     Side effect: Runs ffmpeg subprocess, writes file.
     """
     cmd = [
         'ffmpeg', '-y', '-i', str(y4m_path),
         '-vf', f'scale={size}:{size}:flags=lanczos',
-        '-c:v', 'png', '-pix_fmt', 'rgb48be',
+        '-c:v', 'ffv1', '-level', '3', '-coder', '1', '-context', '1',
+        '-g', '1', '-slices', '24', '-slicecrc', '1',
+        '-pix_fmt', 'gbrp',
         str(output_mp4)
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -40,23 +42,27 @@ def convert_y4m_to_mp4(y4m_path: Path, output_mp4: Path, size: int = 256) -> Tup
 
 def extract_frames(video_path: Path, output_dir: Path, size: int = 256) -> List[Path]:
     """
-    Extract frames from video to 16-bit PNG.
-    
+    Extract frames from video to 8-bit RGB PNG.
+
     Side effect: Runs ffmpeg, creates directory, writes files.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    cmd = f'ffmpeg -y -i "{video_path}" -vf "scale={size}:{size}:flags=lanczos" -pix_fmt rgb48be "{output_dir}/frame_%05d.png"'
+    cmd = f'ffmpeg -y -i "{video_path}" -vf "scale={size}:{size}:flags=lanczos" -pix_fmt rgb24 "{output_dir}/frame_%05d.png"'
     subprocess.run(cmd, shell=True, check=True, capture_output=True)
     return sorted(output_dir.glob("frame_*.png"))
 
 
 def frames_to_video(frames_dir: Path, output_video: Path, fps: float = 30) -> None:
     """
-    Combine frames to lossless MP4 video.
-    
+    Combine frames to a lossless FFV1/MKV video (8-bit planar RGB).
+
     Side effect: Runs ffmpeg, writes video file.
     """
-    cmd = f'ffmpeg -y -framerate {fps} -i "{frames_dir}/frame_%05d.png" -c:v png -pix_fmt rgb48be "{output_video}"'
+    cmd = (
+        f'ffmpeg -y -framerate {fps} -i "{frames_dir}/frame_%05d.png" '
+        f'-c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slices 24 -slicecrc 1 '
+        f'-pix_fmt gbrp "{output_video}"'
+    )
     subprocess.run(cmd, shell=True, check=True, capture_output=True)
 
 
@@ -168,12 +174,12 @@ def load_image(path: Path, size: int) -> torch.Tensor:
     return transform(img)
 
 
-def load_16bit_image(path: Path, size: int) -> torch.Tensor:
+def load_8bit_image(path: Path, size: int) -> torch.Tensor:
     """
-    Load 16-bit PNG image.
-    
+    Load an 8-bit PNG image.
+
     Side effect: Reads file from disk.
-    
+
     Returns:
         Tensor in [-1, 1] range, shape (C, H, W)
     """
@@ -183,28 +189,25 @@ def load_16bit_image(path: Path, size: int) -> torch.Tensor:
     if len(img.shape) == 3 and img.shape[2] == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (size, size), interpolation=cv2.INTER_LANCZOS4)
-    if img.dtype == np.uint16:
-        img = img.astype(np.float32) / 65535.0
-    else:
-        img = img.astype(np.float32) / 255.0
+    img = img.astype(np.float32) / 255.0
     img = img * 2.0 - 1.0
     tensor = torch.from_numpy(img.transpose(2, 0, 1))
     return tensor
 
 
-def save_16bit_png(tensor: torch.Tensor, path: Path) -> None:
+def save_8bit_png(tensor: torch.Tensor, path: Path) -> None:
     """
-    Save tensor as 16-bit PNG.
-    
+    Save tensor as 8-bit PNG (256 levels).
+
     Side effect: Writes file to disk.
-    
+
     Args:
         tensor: Tensor in [-1, 1] range, shape (C, H, W)
         path: Output file path
     """
     tensor = (tensor + 1.0) / 2.0
     tensor = torch.clamp(tensor, 0.0, 1.0)
-    tensor_np = (tensor.detach().cpu().numpy() * 65535.0).round().astype(np.uint16)
+    tensor_np = (tensor.detach().cpu().numpy() * 255.0).round().astype(np.uint8)
     tensor_np = tensor_np.transpose(1, 2, 0)
     tensor_np = cv2.cvtColor(tensor_np, cv2.COLOR_RGB2BGR)
     cv2.imwrite(str(path), tensor_np)
@@ -339,7 +342,7 @@ def save_results_txt(
                 f.write(f"  Size Increase:  {size_increase:.2f}%\n")
             f.write("\n")
         
-        # Pipeline timing section (for research paper)
+        # Pipeline timing section
         if timing_info:
             f.write("-" * 40 + "\n")
             f.write("PIPELINE TIMING (Excluding Metrics)\n")

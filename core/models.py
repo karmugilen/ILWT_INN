@@ -171,7 +171,7 @@ class LearnableSubbandWeights(nn.Module):
 
 
 class LearnableYCbCrScaling(nn.Module):
-    def __init__(self, init_kY=0.02, init_kC=0.06):
+    def __init__(self, init_kY=0.04, init_kC=0.10):
         super(LearnableYCbCrScaling, self).__init__()
         self.log_kY = nn.Parameter(torch.log(torch.tensor(init_kY)))
         self.log_kC = nn.Parameter(torch.log(torch.tensor(init_kC)))
@@ -403,7 +403,7 @@ def get_model_info(config: ModelConfig) -> dict:
     }
 
 MODEL_REGISTRY = {
-    'starinn_ilwt': {
+    'stegowaveflow_ilwt': {
         'factory': create_model,
         'description': 'StegoWaveFlow with Integer Lifting Wavelet Transform',
     }

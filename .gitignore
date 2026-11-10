@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+
+# Datasets and inputs (user-provided, not committed)
+training_data/
+hide/
+secrets/
+*.y4m
+
+# Test/intermediate video files
+akiyo_cif.mkv
+akiyo_cif_256.mkv
+
+# Pipeline outputs
+*_output/
+*_stego_output/
+ilwt_test_results/
+
+# Training artifacts
+checkpoints/
+research_metrics/
+research_plots/
+publication_outputs/
+
+# Logs
+*.log
+*_log.txt
+training_*.txt
+ablation_log.txt
+
+# Ablation results (regeneratable)
+ablation_results.json
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
